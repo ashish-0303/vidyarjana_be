@@ -177,6 +177,234 @@ if (stats) {
   }
 });
 
+// ============================================================
+// RACE CONFIG — add new races here as needed
+// ============================================================
+const RACE_CONFIG = {
+    "1600m": {
+        totalScans:  5,      // 1 start + 4 laps
+        totalRounds: 4,
+        markingCriteria: (totalSeconds) => {
+            if (totalSeconds < 310)  return 20;
+            if (totalSeconds <= 330) return 18;
+            if (totalSeconds <= 350) return 16;
+            if (totalSeconds <= 370) return 14;
+            if (totalSeconds <= 390) return 12;
+            if (totalSeconds <= 410) return 10;
+            if (totalSeconds <= 430) return 8;
+            if (totalSeconds <= 450) return 5;
+            return 0;
+        }
+    }
+    // Add more races here:
+    // "800m":  { totalScans: 3, totalRounds: 2, markingCriteria: (s) => { ... } },
+    // "100m":  { totalScans: 2, totalRounds: 1, markingCriteria: (s) => { ... } },
+};
+
+// ============================================================
+// GET /api/race-students?race=1600m
+// Returns all students registered for a race with status:
+//   "completed"  — all rounds done today
+//   "incomplete" — some rounds done today
+//   "DNS"        — did not start today
+// ============================================================
+app.get("/api/race-students", verifyToken, async (req, res) => {
+    const { role, email } = req.user;
+    const { race } = req.query;
+
+    // ── Validate race param ──────────────────────────────────
+    if (!race) {
+        return res.status(400).json({ error: "Query param 'race' is required (e.g. ?race=1600m)" });
+    }
+
+    const config = RACE_CONFIG[race];
+    if (!config) {
+        return res.status(400).json({
+            error: `Unsupported race type: '${race}'. Supported: ${Object.keys(RACE_CONFIG).join(", ")}`
+        });
+    }
+
+    // ── Role guard ───────────────────────────────────────────
+    if (role !== "superadmin" && role !== "admin") {
+        return res.status(403).json({ error: "Unauthorized access" });
+    }
+
+    const { totalScans, totalRounds, markingCriteria } = config;
+
+    try {
+        const pool    = getPool();
+        const request = pool.request();
+
+        request.input("race_filter", sql.NVarChar, `%"${race}"%`);
+
+        // ── Optional admin filter ────────────────────────────
+        let adminFilter = "";
+        if (role === "admin") {
+            adminFilter = "AND s.created_by = @created_by";
+            request.input("created_by", sql.VarChar, email);
+        }
+
+        // ── Main query ───────────────────────────────────────
+        // Step 1 : Pull all students whose race JSON array contains the
+        //          requested race (e.g. ["1600m"]).
+        // Step 2 : LEFT JOIN with today's tag-log scans so DNS students
+        //          are still returned (with NULL scan data).
+        // Step 3 : Compute round times and total time in SQL; status
+        //          logic is applied in JS after the fetch.
+
+        const query = `
+            WITH
+            -- ── All students registered for this race ──────────────────
+            race_students AS (
+                SELECT
+                    id, roll_no, name, age, weight, contact,
+                    gender, race, academy, student_role,
+                    created_by, created_at, tag_id
+                FROM [zkteco_64n3].[dbo].[student_records] s
+                WHERE s.race LIKE @race_filter          -- JSON array contains the race
+                ${adminFilter}
+            ),
+
+            -- ── Today's scans from the tag reader ───────────────────────
+            ordered_scans AS (
+                SELECT
+                    tag_id,
+                    date,
+                    ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY date ASC) AS rn,
+                    LAG(date)    OVER (PARTITION BY tag_id ORDER BY date ASC) AS prev_date
+                FROM IDT401I_Multiport_Reader.dbo.tbltagLogs
+                WHERE date >= CAST(GETDATE() AS DATE)
+                  AND date <  DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+                  AND tag_id IN (SELECT tag_id FROM race_students)   -- only relevant tags
+            ),
+
+            -- ── Per-round elapsed time (rn 2..5 for 1600m) ──────────────
+            round_calc AS (
+                SELECT
+                    tag_id,
+                    rn,
+                    DATEDIFF(MILLISECOND, prev_date, date) AS round_ms
+                FROM ordered_scans
+                WHERE rn > 1
+            ),
+
+            -- ── Pivot: one row per tag with r1..r4 ──────────────────────
+            round_pivot AS (
+                SELECT
+                    tag_id,
+                    MAX(CASE WHEN rn = 2 THEN round_ms END) AS r1,
+                    MAX(CASE WHEN rn = 3 THEN round_ms END) AS r2,
+                    MAX(CASE WHEN rn = 4 THEN round_ms END) AS r3,
+                    MAX(CASE WHEN rn = 5 THEN round_ms END) AS r4,
+                    COUNT(*)                                 AS rounds_done
+                FROM round_calc
+                GROUP BY tag_id
+            ),
+
+            -- ── Total elapsed time & scan count ─────────────────────────
+            scan_summary AS (
+                SELECT
+                    tag_id,
+                    COUNT(*)                                             AS scan_count,
+                    DATEDIFF(MILLISECOND, MIN(date), MAX(date))         AS total_ms
+                FROM ordered_scans
+                GROUP BY tag_id
+            )
+
+            -- ── Final SELECT: all race students, LEFT JOIN scan data ─────
+            SELECT
+                rs.id,
+                rs.roll_no,
+                rs.name,
+                rs.age,
+                rs.weight,
+                rs.contact,
+                rs.gender,
+                rs.race,
+                rs.academy,
+                rs.student_role,
+                rs.created_by,
+                rs.created_at,
+                rs.tag_id,
+
+                -- Scan / round counts (NULL if DNS)
+                ISNULL(ss.scan_count,    0)   AS scan_count,
+                ISNULL(rp.rounds_done,   0)   AS rounds_done,
+                ISNULL(ss.total_ms,      0)   AS total_ms,
+                ISNULL(ss.total_ms, 0) / 1000 AS total_seconds,
+
+                -- Formatted times
+                FORMAT(DATEADD(MILLISECOND, ISNULL(ss.total_ms, 0), 0), 'HH:mm:ss.fff') AS completionTime,
+                FORMAT(DATEADD(MILLISECOND, rp.r1, 0), 'HH:mm:ss.fff')                  AS round1,
+                FORMAT(DATEADD(MILLISECOND, rp.r2, 0), 'HH:mm:ss.fff')                  AS round2,
+                FORMAT(DATEADD(MILLISECOND, rp.r3, 0), 'HH:mm:ss.fff')                  AS round3,
+                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff')                  AS round4
+
+            FROM race_students rs
+            LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
+            LEFT JOIN round_pivot  rp ON rs.tag_id = rp.tag_id
+            ORDER BY ss.total_ms ASC, rs.roll_no ASC
+        `;
+
+        const result = await request.query(query);
+
+        // ── Shape response in JS ─────────────────────────────────────────
+        const formatted = result.recordset.map(row => {
+
+            // ── Determine status ─────────────────────────────
+            let status;
+            if (row.scan_count === 0) {
+                status = "DNS";                             // Did Not Start
+            } else if (row.scan_count >= totalScans) {
+                status = "completed";
+            } else {
+                status = "incomplete";
+            }
+
+            // ── Marks: only for completed students ───────────
+            const marks = status === "completed"
+                ? markingCriteria(row.total_seconds)
+                : 0;
+
+            return {
+                id:           row.id,
+                roll_no:      row.roll_no,
+                name:         row.name,
+                age:          row.age,
+                weight:       row.weight,
+                contact:      row.contact,
+                gender:       row.gender,
+                race:         row.race,
+                academy:      row.academy,
+                student_role: row.student_role,
+                created_by:   row.created_by,
+                created_at:   row.created_at,
+                tag_id:       row.tag_id,
+
+                status,                                     // "completed" | "incomplete" | "DNS"
+                total_rounds: row.rounds_done,
+                total_seconds: row.total_seconds,
+                completionTime: row.completionTime,
+
+                round_info: {
+                    round1: row.round1 || null,
+                    round2: row.round2 || null,
+                    round3: row.round3 || null,
+                    round4: row.round4 || null
+                },
+
+                marks
+            };
+        });
+
+        res.json(formatted);
+
+    } catch (err) {
+        console.error("Fetch Error:", err);
+        res.status(500).json({ error: "Database error during fetch" });
+    }
+});
+
 // Delete one student
 app.delete("/api/students/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
