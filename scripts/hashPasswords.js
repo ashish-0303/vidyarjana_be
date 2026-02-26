@@ -1,25 +1,3 @@
-// const pool = require('../models/db');
-// const bcrypt = require('bcrypt');
-
-// const hashPasswords = async () => {
-//   try {
-//     const res = await pool.query('SELECT id, password FROM admins');
-//     for (const admin of res.rows) {
-//       if (!admin.password.startsWith('$2b$')) {
-//         const hashed = await bcrypt.hash(admin.password, 10);
-//         await pool.query('UPDATE admins SET password = $1 WHERE id = $2', [hashed, admin.id]);
-//       }
-//     }
-//     console.log('✅ Passwords hashed!');
-//   } catch (error) {
-//     console.error('Error hashing passwords:', error);
-//   } finally {
-//     await pool.end();
-//     process.exit();
-//   }
-// };
-
-// hashPasswords();
 
 import { sql, connectToMSSQL } from '../models/db.js';
 import bcrypt from 'bcrypt';
