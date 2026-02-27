@@ -243,74 +243,74 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
             request.input("created_by", sql.VarChar, email);
         }
 
-        // ── Main query ───────────────────────────────────────
-        // Step 1 : Pull all students whose race JSON array contains the
-        //          requested race (e.g. ["1600m"]).
-        // Step 2 : LEFT JOIN with today's tag-log scans so DNS students
-        //          are still returned (with NULL scan data).
-        // Step 3 : Compute round times and total time in SQL; status
-        //          logic is applied in JS after the fetch.
-
         const query = `
             WITH
-            -- ── All students registered for this race ──────────────────
-            race_students AS (
-                SELECT
-                    id, roll_no, name, age, weight, contact,
-                    gender, race, academy, student_role,
-                    created_by, created_at, tag_id
-                FROM [zkteco_64n3].[dbo].[student_records] s
-                WHERE s.race = @race_filter
+-- ── All students registered for this race ──────────────────
+race_students AS (
+    SELECT
+        id, roll_no, name, age, weight, contact,
+        gender, race, academy, student_role,
+        created_by, created_at, tag_id
+    FROM [zkteco_64n3].[dbo].[student_records] s
+            WHERE s.race = @race_filter
                 ${adminFilter}
-            ),
+                ),
 
-            -- ── Today's scans from the tag reader ───────────────────────
-            ordered_scans AS (
-                SELECT
-                    tag_id,
-                    date,
-                    ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY date ASC) AS rn,
-                    LAG(date)    OVER (PARTITION BY tag_id ORDER BY date ASC) AS prev_date
-                FROM IDT401I_Multiport_Reader.dbo.tbltagLogs
-                WHERE date >= CAST(GETDATE() AS DATE)
-                  AND date <  DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
-                  AND tag_id IN (SELECT tag_id FROM race_students)   -- only relevant tags
-            ),
+-- ── Today's scans (only relevant tags) ──────────────────────
+                ordered_scans AS (
+            SELECT
+                tag_id,
+                date,
+                ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY date ASC) AS rn
+            FROM IDT401I_Multiport_Reader.dbo.tbltagLogs
+            WHERE date >= CAST(GETDATE() AS DATE)
+              AND date <  DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+              AND tag_id IN (SELECT tag_id FROM race_students)
+                ),
 
-            -- ── Per-round elapsed time (rn 2..5 for 1600m) ──────────────
-            round_calc AS (
-                SELECT
-                    tag_id,
-                    rn,
-                    DATEDIFF(MILLISECOND, prev_date, date) AS round_ms
-                FROM ordered_scans
-                WHERE rn > 1
-            ),
+-- ── Only required scans (for 1600m = first 5 scans only) ────
+                limited_scans AS (
+            SELECT *
+            FROM ordered_scans
+            WHERE rn <= ${totalScans}
+                ),
 
-            -- ── Pivot: one row per tag with r1..r4 ──────────────────────
-            round_pivot AS (
-                SELECT
-                    tag_id,
-                    MAX(CASE WHEN rn = 2 THEN round_ms END) AS r1,
-                    MAX(CASE WHEN rn = 3 THEN round_ms END) AS r2,
-                    MAX(CASE WHEN rn = 4 THEN round_ms END) AS r3,
-                    MAX(CASE WHEN rn = 5 THEN round_ms END) AS r4,
-                    COUNT(*)                                 AS rounds_done
-                FROM round_calc
-                GROUP BY tag_id
-            ),
+-- ── Round calculation (only first 4 rounds) ─────────────────
+                round_calc AS (
+            SELECT
+                tag_id,
+                rn,
+                DATEDIFF(MILLISECOND,
+                LAG(date) OVER (PARTITION BY tag_id ORDER BY rn),
+                date) AS round_ms
+            FROM limited_scans
+                ),
 
-            -- ── Total elapsed time & scan count ─────────────────────────
-            scan_summary AS (
-                SELECT
-                    tag_id,
-                    COUNT(*)                                             AS scan_count,
-                    DATEDIFF(MILLISECOND, MIN(date), MAX(date))         AS total_ms
-                FROM ordered_scans
-                GROUP BY tag_id
-            )
+-- ── Pivot rounds (r1..r4) ───────────────────────────────────
+                round_pivot AS (
+            SELECT
+                tag_id,
+                MAX(CASE WHEN rn = 2 THEN round_ms END) AS r1,
+                MAX(CASE WHEN rn = 3 THEN round_ms END) AS r2,
+                MAX(CASE WHEN rn = 4 THEN round_ms END) AS r3,
+                MAX(CASE WHEN rn = 5 THEN round_ms END) AS r4,
+                COUNT(*) - 1 AS rounds_done
+            FROM round_calc
+            WHERE rn <= ${totalScans}
+            GROUP BY tag_id
+                ),
 
-            -- ── Final SELECT: all race students, LEFT JOIN scan data ─────
+-- ── Total time (ONLY rn = 1 to rn = 5) ─────────────────────
+                scan_summary AS (
+            SELECT
+                tag_id,
+                COUNT(*) AS scan_count,
+                DATEDIFF(MILLISECOND, MIN(date), MAX(date)) AS total_ms
+            FROM limited_scans
+            GROUP BY tag_id
+                )
+
+-- ── Final Output ────────────────────────────────────────────
             SELECT
                 rs.id,
                 rs.roll_no,
@@ -326,23 +326,22 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
                 rs.created_at,
                 rs.tag_id,
 
-                -- Scan / round counts (NULL if DNS)
-                ISNULL(ss.scan_count,    0)   AS scan_count,
-                ISNULL(rp.rounds_done,   0)   AS rounds_done,
-                ISNULL(ss.total_ms,      0)   AS total_ms,
+                ISNULL(ss.scan_count, 0) AS scan_count,
+                ISNULL(rp.rounds_done, 0) AS rounds_done,
+                ISNULL(ss.total_ms, 0) AS total_ms,
                 ISNULL(ss.total_ms, 0) / 1000 AS total_seconds,
 
-                -- Formatted times
                 FORMAT(DATEADD(MILLISECOND, ISNULL(ss.total_ms, 0), 0), 'HH:mm:ss.fff') AS completionTime,
-                FORMAT(DATEADD(MILLISECOND, rp.r1, 0), 'HH:mm:ss.fff')                  AS round1,
-                FORMAT(DATEADD(MILLISECOND, rp.r2, 0), 'HH:mm:ss.fff')                  AS round2,
-                FORMAT(DATEADD(MILLISECOND, rp.r3, 0), 'HH:mm:ss.fff')                  AS round3,
-                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff')                  AS round4
+
+                FORMAT(DATEADD(MILLISECOND, rp.r1, 0), 'HH:mm:ss.fff') AS round1,
+                FORMAT(DATEADD(MILLISECOND, rp.r2, 0), 'HH:mm:ss.fff') AS round2,
+                FORMAT(DATEADD(MILLISECOND, rp.r3, 0), 'HH:mm:ss.fff') AS round3,
+                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff') AS round4
 
             FROM race_students rs
-            LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
-            LEFT JOIN round_pivot  rp ON rs.tag_id = rp.tag_id
-            ORDER BY ss.total_ms ASC, rs.roll_no ASC
+                     LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
+                     LEFT JOIN round_pivot rp ON rs.tag_id = rp.tag_id
+            ORDER BY ss.total_ms ASC, rs.roll_no ASC;
         `;
 
         const result = await request.query(query);
