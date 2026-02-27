@@ -177,66 +177,46 @@ if (stats) {
 });
 
 // ============================================================
-// RACE CONFIG — add new races here as needed
+// RACE CONFIG (only for scan count control)
 // ============================================================
 const RACE_CONFIG = {
-    "1600m": {
-        totalScans:  5,      // 1 start + 4 laps
-        totalRounds: 4,
-        markingCriteria: (totalSeconds) => {
-            if (totalSeconds < 310)  return 20;
-            if (totalSeconds <= 330) return 18;
-            if (totalSeconds <= 350) return 16;
-            if (totalSeconds <= 370) return 14;
-            if (totalSeconds <= 390) return 12;
-            if (totalSeconds <= 410) return 10;
-            if (totalSeconds <= 430) return 8;
-            if (totalSeconds <= 450) return 5;
-            return 0;
-        }
-    }
-    // Add more races here:
-    // "800m":  { totalScans: 3, totalRounds: 2, markingCriteria: (s) => { ... } },
-    // "100m":  { totalScans: 2, totalRounds: 1, markingCriteria: (s) => { ... } },
+    "1600m": { totalScans: 5, totalRounds: 4 },
+    "800m":  { totalScans: 3, totalRounds: 2 },
+    "100m":  { totalScans: 2, totalRounds: 1 }
 };
 
 // ============================================================
 // GET /api/race-students?race=1600m
-// Returns all students registered for a race with status:
-//   "completed"  — all rounds done today
-//   "incomplete" — some rounds done today
-//   "DNS"        — did not start today
 // ============================================================
 app.get("/api/race-students", verifyToken, async (req, res) => {
     const { role, email } = req.user;
     const { race } = req.query;
 
-    // ── Validate race param ──────────────────────────────────
     if (!race) {
-        return res.status(400).json({ error: "Query param 'race' is required (e.g. ?race=1600m)" });
+        return res.status(400).json({
+            error: "Query param 'race' is required (e.g. ?race=1600m)"
+        });
     }
 
     const config = RACE_CONFIG[race];
     if (!config) {
         return res.status(400).json({
-            error: `Unsupported race type: '${race}'. Supported: ${Object.keys(RACE_CONFIG).join(", ")}`
+            error: `Unsupported race type: '${race}'.`
         });
     }
 
-    // ── Role guard ───────────────────────────────────────────
     if (role !== "superadmin" && role !== "admin") {
         return res.status(403).json({ error: "Unauthorized access" });
     }
 
-    const { totalScans, totalRounds, markingCriteria } = config;
+    const { totalScans } = config;
 
     try {
-        const pool    = getPool();
+        const pool = getPool();
         const request = pool.request();
 
         request.input("race_filter", sql.NVarChar, race);
 
-        // ── Optional admin filter ────────────────────────────
         let adminFilter = "";
         if (role === "admin") {
             adminFilter = "AND s.created_by = @created_by";
@@ -245,18 +225,16 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
 
         const query = `
             WITH
--- ── All students registered for this race ──────────────────
-race_students AS (
-    SELECT
-        id, roll_no, name, age, weight, contact,
-        gender, race, academy, student_role,
-        created_by, created_at, tag_id
-    FROM [zkteco_64n3].[dbo].[student_records] s
+                race_students AS (
+                    SELECT
+                        id, roll_no, name, age, weight, contact,
+                        gender, race, academy, student_role,
+                        created_by, created_at, tag_id
+                    FROM [zkteco_64n3].[dbo].[student_records] s
             WHERE s.race = @race_filter
                 ${adminFilter}
                 ),
 
--- ── Today's scans (only relevant tags) ──────────────────────
                 ordered_scans AS (
             SELECT
                 tag_id,
@@ -268,25 +246,24 @@ race_students AS (
               AND tag_id IN (SELECT tag_id FROM race_students)
                 ),
 
--- ── Only required scans (for 1600m = first 5 scans only) ────
                 limited_scans AS (
             SELECT *
             FROM ordered_scans
             WHERE rn <= ${totalScans}
                 ),
 
--- ── Round calculation (only first 4 rounds) ─────────────────
                 round_calc AS (
             SELECT
                 tag_id,
                 rn,
-                DATEDIFF(MILLISECOND,
+                DATEDIFF(
+                MILLISECOND,
                 LAG(date) OVER (PARTITION BY tag_id ORDER BY rn),
-                date) AS round_ms
+                date
+                ) AS round_ms
             FROM limited_scans
                 ),
 
--- ── Pivot rounds (r1..r4) ───────────────────────────────────
                 round_pivot AS (
             SELECT
                 tag_id,
@@ -296,11 +273,9 @@ race_students AS (
                 MAX(CASE WHEN rn = 5 THEN round_ms END) AS r4,
                 COUNT(*) - 1 AS rounds_done
             FROM round_calc
-            WHERE rn <= ${totalScans}
             GROUP BY tag_id
                 ),
 
--- ── Total time (ONLY rn = 1 to rn = 5) ─────────────────────
                 scan_summary AS (
             SELECT
                 tag_id,
@@ -310,7 +285,6 @@ race_students AS (
             GROUP BY tag_id
                 )
 
--- ── Final Output ────────────────────────────────────────────
             SELECT
                 rs.id,
                 rs.roll_no,
@@ -336,50 +310,55 @@ race_students AS (
                 FORMAT(DATEADD(MILLISECOND, rp.r1, 0), 'HH:mm:ss.fff') AS round1,
                 FORMAT(DATEADD(MILLISECOND, rp.r2, 0), 'HH:mm:ss.fff') AS round2,
                 FORMAT(DATEADD(MILLISECOND, rp.r3, 0), 'HH:mm:ss.fff') AS round3,
-                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff') AS round4
+                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff') AS round4,
+
+                -- Marks from DB
+                ISNULL(mc.marks, 0) AS marks
 
             FROM race_students rs
                      LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
                      LEFT JOIN round_pivot rp ON rs.tag_id = rp.tag_id
+
+                     LEFT JOIN [zkteco_64n3].[dbo].[student_marks_criteria] mc
+            ON mc.gender   = rs.gender
+                AND mc.post     = rs.student_role
+                AND mc.distance = rs.race
+                AND (ISNULL(ss.total_ms,0) / 1000)
+                BETWEEN mc.min_seconds AND mc.max_seconds
+                AND ISNULL(ss.scan_count,0) >= ${totalScans}
+
             ORDER BY ss.total_ms ASC, rs.roll_no ASC;
         `;
 
         const result = await request.query(query);
 
-        // ── Shape response in JS ─────────────────────────────────────────
         const formatted = result.recordset.map(row => {
 
-            // ── Determine status ─────────────────────────────
             let status;
             if (row.scan_count === 0) {
-                status = "DNS";                             // Did Not Start
+                status = "DNS";
             } else if (row.scan_count >= totalScans) {
                 status = "completed";
             } else {
                 status = "incomplete";
             }
 
-            // ── Marks: only for completed students ───────────
-            const marks = status === "completed"
-                ? markingCriteria(row.total_seconds)
-                : 0;
-
             return {
-                id:           row.id,
-                roll_no:      row.roll_no,
-                name:         row.name,
-                age:          row.age,
-                weight:       row.weight,
-                contact:      row.contact,
-                gender:       row.gender,
-                race:         row.race,
-                academy:      row.academy,
+                id: row.id,
+                roll_no: row.roll_no,
+                name: row.name,
+                age: row.age,
+                weight: row.weight,
+                contact: row.contact,
+                gender: row.gender,
+                race: row.race,
+                academy: row.academy,
                 student_role: row.student_role,
-                created_by:   row.created_by,
-                created_at:   row.created_at,
-                tag_id:       row.tag_id,
+                created_by: row.created_by,
+                created_at: row.created_at,
+                tag_id: row.tag_id,
 
-                status,                                     // "completed" | "incomplete" | "DNS"
+                status,
                 total_rounds: row.rounds_done,
                 total_seconds: row.total_seconds,
                 completionTime: row.completionTime,
@@ -391,7 +370,7 @@ race_students AS (
                     round4: row.round4 || null
                 },
 
-                marks
+                marks: row.marks
             };
         });
 
