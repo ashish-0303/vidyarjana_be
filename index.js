@@ -78,7 +78,7 @@ app.post("/api/students", verifyToken, async (req, res) => {
  .input("weight", sql.Float, weight)
  .input("contact", sql.VarChar, contact)
  .input("gender", sql.VarChar, gender)
- .input("race", sql.NVarChar, JSON.stringify(race))
+ .input("race", sql.NVarChar, race)
  .input("academy", sql.VarChar, academy)
  .input("student_role", sql.VarChar, studentRole || null)
  .input("created_by", sql.VarChar, createdBy)
@@ -91,7 +91,6 @@ app.post("/api/students", verifyToken, async (req, res) => {
 
     // Parse race before sending back:
     const student = result.recordset[0];
-    student.race = JSON.parse(student.race);
 
     res.status(201).json({ message: "Student added successfully!", student });
   } catch (err) {
@@ -235,7 +234,7 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
         const pool    = getPool();
         const request = pool.request();
 
-        request.input("race_filter", sql.NVarChar, `%"${race}"%`);
+        request.input("race_filter", sql.NVarChar, race);
 
         // ── Optional admin filter ────────────────────────────
         let adminFilter = "";
@@ -261,7 +260,7 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
                     gender, race, academy, student_role,
                     created_by, created_at, tag_id
                 FROM [zkteco_64n3].[dbo].[student_records] s
-                WHERE s.race LIKE @race_filter          -- JSON array contains the race
+                WHERE s.race = @race_filter
                 ${adminFilter}
             ),
 
