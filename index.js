@@ -64,33 +64,47 @@ app.get("/", (req, res) => {
 app.use("/api/admins", adminRoutes);
 
 app.post("/api/students", verifyToken, async (req, res) => {
-  const { rollNo, name, age, tag_id, weight, contact, gender, race, academy, studentRole } = req.body;
-  const createdBy = req.user.email;
+    const {
+        rollNo,
+        name,
+        age,
+        tag_id,
+        weight,
+        contact,
+        gender,
+        race,
+        running_ground,   // ✅ Added
+        academy,
+        studentRole
+    } = req.body;
 
-  // All validation, then:
-  try {
-    const pool = getPool();
-    const result = await pool.request()
- .input("roll_no", sql.VarChar, rollNo)
- .input("name", sql.VarChar, name)
- .input("age", sql.Int, age)
- .input("tag_id", sql.NVarChar, req.body.tag_id)
- .input("weight", sql.Float, weight)
- .input("contact", sql.VarChar, contact)
- .input("gender", sql.VarChar, gender)
- .input("race", sql.NVarChar, race)
- .input("academy", sql.VarChar, academy)
- .input("student_role", sql.VarChar, studentRole || null)
- .input("created_by", sql.VarChar, createdBy)
- .query(`
-   INSERT INTO student_records 
-   (roll_no, name, age, tag_id, weight, contact, gender, race, academy, student_role, created_by, created_at)
-   OUTPUT INSERTED.*
-   VALUES (@roll_no, @name, @age, @tag_id, @weight, @contact, @gender, @race, @academy, @student_role, @created_by, GETDATE())
- `);
+    const createdBy = req.user.email;
 
-    // Parse race before sending back:
-    const student = result.recordset[0];
+    try {
+        const pool = getPool();
+
+        const result = await pool.request()
+            .input("roll_no", sql.VarChar, rollNo)
+            .input("name", sql.VarChar, name)
+            .input("age", sql.Int, age)
+            .input("tag_id", sql.NVarChar, tag_id)
+            .input("weight", sql.Float, weight)
+            .input("contact", sql.VarChar, contact)
+            .input("gender", sql.VarChar, gender)
+            .input("race", sql.NVarChar, race)
+            .input("running_ground", sql.NVarChar, running_ground || race) // ✅ if null use race
+            .input("academy", sql.VarChar, academy)
+            .input("student_role", sql.VarChar, studentRole || null)
+            .input("created_by", sql.VarChar, createdBy)
+            .query(`
+                INSERT INTO student_records
+                (roll_no, name, age, tag_id, weight, contact, gender, race, running_ground, academy, student_role, created_by, created_at)
+                    OUTPUT INSERTED.*
+                VALUES
+                    (@roll_no, @name, @age, @tag_id, @weight, @contact, @gender, @race, @running_ground, @academy, @student_role, @created_by, GETDATE())
+            `);
+
+        const student = result.recordset[0];
 
     res.status(201).json({ message: "Student added successfully!", student });
   } catch (err) {
