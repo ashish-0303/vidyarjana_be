@@ -176,18 +176,6 @@ if (stats) {
   }
 });
 
-// ============================================================
-// RACE CONFIG (only for scan count control)
-// ============================================================
-const RACE_CONFIG = {
-    "1600m": { totalScans: 5, totalRounds: 4 },
-    "800m":  { totalScans: 3, totalRounds: 2 },
-    "100m":  { totalScans: 2, totalRounds: 1 }
-};
-
-// ============================================================
-// GET /api/race-students?race=1600m
-// ============================================================
 app.get("/api/race-students", verifyToken, async (req, res) => {
     const { role, email } = req.user;
     const { race } = req.query;
@@ -198,23 +186,13 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
         });
     }
 
-    const config = RACE_CONFIG[race];
-    if (!config) {
-        return res.status(400).json({
-            error: `Unsupported race type: '${race}'.`
-        });
-    }
-
     if (role !== "superadmin" && role !== "admin") {
         return res.status(403).json({ error: "Unauthorized access" });
     }
 
-    const { totalScans } = config;
-
     try {
         const pool = getPool();
         const request = pool.request();
-
         request.input("race_filter", sql.NVarChar, race);
 
         let adminFilter = "";
@@ -225,66 +203,117 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
 
         const query = `
             WITH
-                race_students AS (
-                    SELECT
-                        id, roll_no, name, age, weight, contact,
-                        gender, race, academy, student_role,
-                        created_by, created_at, tag_id
-                    FROM [zkteco_64n3].[dbo].[student_records] s
-            WHERE s.race = @race_filter
+            -- ── 1. Students enrolled in the selected race ──────────────────
+            race_students AS (
+                SELECT
+                    id, roll_no, name, age, weight, contact,
+                    gender, race, running_ground, academy, student_role,
+                    created_by, created_at, tag_id
+                FROM [zkteco_64n3].[dbo].[student_records] s
+                WHERE s.race = @race_filter
                 ${adminFilter}
-                ),
+            ),
 
-                ordered_scans AS (
-            SELECT
-                tag_id,
-                date,
-                ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY date ASC) AS rn
-            FROM IDT401I_Multiport_Reader.dbo.tbltagLogs
-            WHERE date >= CAST(GETDATE() AS DATE)
-              AND date <  DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
-              AND tag_id IN (SELECT tag_id FROM race_students)
-                ),
+            -- ── 2. Per-student scan/round config from race × running_ground ─
+            --   Special rule: 1600m on 800m ground → only 2 scans (token carry)
+            --   All others:   required_scans = (race / ground) + 1
+            --                 required_rounds = (race / ground)
+            race_config AS (
+                SELECT
+                    tag_id,
+                    running_ground,
+                    CASE
+                        WHEN race = '1600m' AND running_ground = '200m'  THEN 9   -- 8 rounds
+                        WHEN race = '1600m' AND running_ground = '400m'  THEN 5   -- 4 rounds
+                        WHEN race = '1600m' AND running_ground = '800m'  THEN 2   -- 2 rounds, token carry (no mid scan)
+                        WHEN race = '1600m' AND running_ground = '1600m' THEN 2   -- 1 round
+                        WHEN race = '800m'  AND running_ground = '400m'  THEN 3   -- 2 rounds
+                        WHEN race = '800m'  AND running_ground = '800m'  THEN 2   -- 1 round
+                        WHEN race = '100m'  AND running_ground = '100m'  THEN 2   -- 1 round
+                        ELSE -- Generic fallback: scans = (race_m / ground_m) + 1
+                            CAST(
+                                CAST(REPLACE(race, 'm', '') AS FLOAT)
+                                / NULLIF(CAST(REPLACE(running_ground, 'm', '') AS FLOAT), 0)
+                            AS INT) + 1
+                    END AS required_scans,
+                    CASE
+                        WHEN race = '1600m' AND running_ground = '200m'  THEN 8
+                        WHEN race = '1600m' AND running_ground = '400m'  THEN 4
+                        WHEN race = '1600m' AND running_ground = '800m'  THEN 2   -- token carry still = 2 rounds
+                        WHEN race = '1600m' AND running_ground = '1600m' THEN 1
+                        WHEN race = '800m'  AND running_ground = '400m'  THEN 2
+                        WHEN race = '800m'  AND running_ground = '800m'  THEN 1
+                        WHEN race = '100m'  AND running_ground = '100m'  THEN 1
+                        ELSE -- Generic fallback: rounds = (race_m / ground_m)
+                            CAST(
+                                CAST(REPLACE(race, 'm', '') AS FLOAT)
+                                / NULLIF(CAST(REPLACE(running_ground, 'm', '') AS FLOAT), 0)
+                            AS INT)
+                    END AS required_rounds
+                FROM race_students
+            ),
 
-                limited_scans AS (
-            SELECT *
-            FROM ordered_scans
-            WHERE rn <= ${totalScans}
-                ),
+            -- ── 3. All today's scans, numbered per tag (unlimited) ──────────
+            ordered_scans AS (
+                SELECT
+                    tag_id,
+                    date,
+                    ROW_NUMBER() OVER (PARTITION BY tag_id ORDER BY date ASC) AS rn
+                FROM IDT401I_Multiport_Reader.dbo.tbltagLogs
+                WHERE date >= CAST(GETDATE() AS DATE)
+                  AND date <  DATEADD(DAY, 1, CAST(GETDATE() AS DATE))
+                  AND tag_id IN (SELECT tag_id FROM race_students)
+            ),
 
-                round_calc AS (
-            SELECT
-                tag_id,
-                rn,
-                DATEDIFF(
-                MILLISECOND,
-                LAG(date) OVER (PARTITION BY tag_id ORDER BY rn),
-                date
-                ) AS round_ms
-            FROM limited_scans
-                ),
+            -- ── 4. Cap scans per student at their required_scans ────────────
+            limited_scans AS (
+                SELECT os.tag_id, os.date, os.rn
+                FROM ordered_scans os
+                JOIN race_config rc ON os.tag_id = rc.tag_id
+                WHERE os.rn <= rc.required_scans          -- ← dynamic per student
+            ),
 
-                round_pivot AS (
-            SELECT
-                tag_id,
-                MAX(CASE WHEN rn = 2 THEN round_ms END) AS r1,
-                MAX(CASE WHEN rn = 3 THEN round_ms END) AS r2,
-                MAX(CASE WHEN rn = 4 THEN round_ms END) AS r3,
-                MAX(CASE WHEN rn = 5 THEN round_ms END) AS r4,
-                COUNT(*) - 1 AS rounds_done
-            FROM round_calc
-            GROUP BY tag_id
-                ),
+            -- ── 5. Gap between consecutive scans = one round time ──────────
+            round_calc AS (
+                SELECT
+                    tag_id,
+                    rn,
+                    DATEDIFF(MILLISECOND,
+                        LAG(date) OVER (PARTITION BY tag_id ORDER BY rn),
+                        date) AS round_ms
+                FROM limited_scans
+            ),
 
-                scan_summary AS (
-            SELECT
-                tag_id,
-                COUNT(*) AS scan_count,
-                DATEDIFF(MILLISECOND, MIN(date), MAX(date)) AS total_ms
-            FROM limited_scans
-            GROUP BY tag_id
-                )
+            -- ── 6. Pivot up to 10 rounds ────────────────────────────────────
+            round_pivot AS (
+                SELECT
+                    tag_id,
+                    MAX(CASE WHEN rn = 2  THEN round_ms END) AS r1,
+                    MAX(CASE WHEN rn = 3  THEN round_ms END) AS r2,
+                    MAX(CASE WHEN rn = 4  THEN round_ms END) AS r3,
+                    MAX(CASE WHEN rn = 5  THEN round_ms END) AS r4,
+                    MAX(CASE WHEN rn = 6  THEN round_ms END) AS r5,
+                    MAX(CASE WHEN rn = 7  THEN round_ms END) AS r6,
+                    MAX(CASE WHEN rn = 8  THEN round_ms END) AS r7,
+                    MAX(CASE WHEN rn = 9  THEN round_ms END) AS r8,
+                    MAX(CASE WHEN rn = 10 THEN round_ms END) AS r9,
+                    MAX(CASE WHEN rn = 11 THEN round_ms END) AS r10,
+                    COUNT(*) - 1 AS rounds_done
+                FROM round_calc
+                GROUP BY tag_id
+            ),
 
+            -- ── 7. Total scan count + total elapsed ms per tag ──────────────
+            scan_summary AS (
+                SELECT
+                    tag_id,
+                    COUNT(*)                                        AS scan_count,
+                    DATEDIFF(MILLISECOND, MIN(date), MAX(date))    AS total_ms
+                FROM limited_scans
+                GROUP BY tag_id
+            )
+
+            -- ── 8. Final SELECT ─────────────────────────────────────────────
             SELECT
                 rs.id,
                 rs.roll_no,
@@ -294,38 +323,48 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
                 rs.contact,
                 rs.gender,
                 rs.race,
+                rs.running_ground,
                 rs.academy,
                 rs.student_role,
                 rs.created_by,
                 rs.created_at,
                 rs.tag_id,
 
-                ISNULL(ss.scan_count, 0) AS scan_count,
-                ISNULL(rp.rounds_done, 0) AS rounds_done,
-                ISNULL(ss.total_ms, 0) AS total_ms,
-                ISNULL(ss.total_ms, 0) / 1000 AS total_seconds,
+                rc.required_scans,
+                rc.required_rounds,
+
+                ISNULL(ss.scan_count, 0)        AS scan_count,
+                ISNULL(rp.rounds_done, 0)        AS rounds_done,
+                ISNULL(ss.total_ms, 0)           AS total_ms,
+                ISNULL(ss.total_ms, 0) / 1000    AS total_seconds,
 
                 FORMAT(DATEADD(MILLISECOND, ISNULL(ss.total_ms, 0), 0), 'HH:mm:ss.fff') AS completionTime,
 
-                FORMAT(DATEADD(MILLISECOND, rp.r1, 0), 'HH:mm:ss.fff') AS round1,
-                FORMAT(DATEADD(MILLISECOND, rp.r2, 0), 'HH:mm:ss.fff') AS round2,
-                FORMAT(DATEADD(MILLISECOND, rp.r3, 0), 'HH:mm:ss.fff') AS round3,
-                FORMAT(DATEADD(MILLISECOND, rp.r4, 0), 'HH:mm:ss.fff') AS round4,
+                -- Round times (up to 10)
+                FORMAT(DATEADD(MILLISECOND, rp.r1,  0), 'HH:mm:ss.fff') AS round1,
+                FORMAT(DATEADD(MILLISECOND, rp.r2,  0), 'HH:mm:ss.fff') AS round2,
+                FORMAT(DATEADD(MILLISECOND, rp.r3,  0), 'HH:mm:ss.fff') AS round3,
+                FORMAT(DATEADD(MILLISECOND, rp.r4,  0), 'HH:mm:ss.fff') AS round4,
+                FORMAT(DATEADD(MILLISECOND, rp.r5,  0), 'HH:mm:ss.fff') AS round5,
+                FORMAT(DATEADD(MILLISECOND, rp.r6,  0), 'HH:mm:ss.fff') AS round6,
+                FORMAT(DATEADD(MILLISECOND, rp.r7,  0), 'HH:mm:ss.fff') AS round7,
+                FORMAT(DATEADD(MILLISECOND, rp.r8,  0), 'HH:mm:ss.fff') AS round8,
+                FORMAT(DATEADD(MILLISECOND, rp.r9,  0), 'HH:mm:ss.fff') AS round9,
+                FORMAT(DATEADD(MILLISECOND, rp.r10, 0), 'HH:mm:ss.fff') AS round10,
 
-                -- Marks from DB
+                -- Marks: only awarded when all required scans are present
                 ISNULL(mc.marks, 0) AS marks
 
             FROM race_students rs
-                     LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
-                     LEFT JOIN round_pivot rp ON rs.tag_id = rp.tag_id
-
-                     LEFT JOIN [zkteco_64n3].[dbo].[student_marks_criteria] mc
-            ON mc.gender   = rs.gender
+            JOIN  race_config rc ON rs.tag_id = rc.tag_id
+            LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
+            LEFT JOIN round_pivot  rp ON rs.tag_id = rp.tag_id
+            LEFT JOIN [zkteco_64n3].[dbo].[student_marks_criteria] mc
+                ON  mc.gender   = rs.gender
                 AND mc.post     = rs.student_role
                 AND mc.distance = rs.race
-                AND (ISNULL(ss.total_ms,0) / 1000)
-                BETWEEN mc.min_seconds AND mc.max_seconds
-                AND ISNULL(ss.scan_count,0) >= ${totalScans}
+                AND (ISNULL(ss.total_ms, 0) / 1000) BETWEEN mc.min_seconds AND mc.max_seconds
+                AND ISNULL(ss.scan_count, 0) >= rc.required_scans   -- ← dynamic
 
             ORDER BY ss.total_ms ASC, rs.roll_no ASC;
         `;
@@ -333,42 +372,48 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
         const result = await request.query(query);
 
         const formatted = result.recordset.map(row => {
-
+            // Status uses per-student required_scans from DB
             let status;
             if (row.scan_count === 0) {
                 status = "DNS";
-            } else if (row.scan_count >= totalScans) {
+            } else if (row.scan_count >= row.required_scans) {
                 status = "completed";
             } else {
                 status = "incomplete";
             }
 
+            // Build round_info dynamically — only include rounds that exist
+            const round_info = {};
+            for (let i = 1; i <= 10; i++) {
+                const val = row[`round${i}`];
+                if (val) round_info[`round${i}`] = val;
+            }
+
             return {
-                id: row.id,
-                roll_no: row.roll_no,
-                name: row.name,
-                age: row.age,
-                weight: row.weight,
-                contact: row.contact,
-                gender: row.gender,
-                race: row.race,
-                academy: row.academy,
-                student_role: row.student_role,
-                created_by: row.created_by,
-                created_at: row.created_at,
-                tag_id: row.tag_id,
+                id:             row.id,
+                roll_no:        row.roll_no,
+                name:           row.name,
+                age:            row.age,
+                weight:         row.weight,
+                contact:        row.contact,
+                gender:         row.gender,
+                race:           row.race,
+                running_ground: row.running_ground,
+                academy:        row.academy,
+                student_role:   row.student_role,
+                created_by:     row.created_by,
+                created_at:     row.created_at,
+                tag_id:         row.tag_id,
+
+                required_scans:  row.required_scans,
+                required_rounds: row.required_rounds,
 
                 status,
-                total_rounds: row.rounds_done,
-                total_seconds: row.total_seconds,
+                total_rounds:   row.rounds_done,
+                total_seconds:  row.total_seconds,
                 completionTime: row.completionTime,
 
-                round_info: {
-                    round1: row.round1 || null,
-                    round2: row.round2 || null,
-                    round3: row.round3 || null,
-                    round4: row.round4 || null
-                },
+                round_info,   // only populated rounds included
 
                 marks: row.marks
             };
@@ -381,7 +426,6 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
         res.status(500).json({ error: "Database error during fetch" });
     }
 });
-
 // Delete one student
 app.delete("/api/students/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
