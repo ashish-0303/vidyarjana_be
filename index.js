@@ -353,18 +353,22 @@ app.get("/api/race-students", verifyToken, async (req, res) => {
                 FORMAT(DATEADD(MILLISECOND, rp.r10, 0), 'HH:mm:ss.fff') AS round10,
 
                 -- Marks: only awarded when all required scans are present
-                ISNULL(mc.marks, 0) AS marks
-
+                CASE
+                    WHEN ISNULL(ss.scan_count, 0) >= rc.required_scans
+                        THEN ISNULL(mc.marks, 0)
+                    ELSE 0
+                    END AS marks
+            
             FROM race_students rs
             JOIN  race_config rc ON rs.tag_id = rc.tag_id
             LEFT JOIN scan_summary ss ON rs.tag_id = ss.tag_id
             LEFT JOIN round_pivot  rp ON rs.tag_id = rp.tag_id
             LEFT JOIN [zkteco_64n3].[dbo].[student_marks_criteria] mc
-                ON  mc.gender   = rs.gender
+            ON  mc.gender   = rs.gender
                 AND mc.post     = rs.student_role
                 AND mc.distance = rs.race
-                AND (ISNULL(ss.total_ms, 0) / 1000) BETWEEN mc.min_seconds AND mc.max_seconds
-                AND ISNULL(ss.scan_count, 0) >= rc.required_scans   -- ← dynamic
+                AND FLOOR(ISNULL(ss.total_ms, 0) / 1000.0)
+                BETWEEN mc.min_seconds AND mc.max_seconds
 
             ORDER BY ss.total_ms ASC, rs.roll_no ASC;
         `;
